@@ -1005,8 +1005,10 @@ async fn process_translation_loop(
 ) {
     use twilight_model::channel::message::embed::Embed;
     use twilight_model::channel::message::embed::EmbedField;
+    use transcriber::compute_rms;
     use transcriber::convert_i16_to_f32;
     use transcriber::downsample_48k_to_16k;
+    use transcriber::is_likely_hallucination;
     use std::time::Instant;
 
     loop {
@@ -1039,6 +1041,11 @@ async fn process_translation_loop(
                 let total_start = Instant::now();
                 let convert_start = Instant::now();
                 let samples_f32 = convert_i16_to_f32(&samples);
+                let rms = compute_rms(&samples_f32);
+                if rms < 0.005 {
+                    println!("[INFO] Skipping low-volume audio (rms={:.5}) for user {}", rms, user_id);
+                    return;
+                }
                 let final_samples = downsample_48k_to_16k(&samples_f32);
                 let convert_time = convert_start.elapsed();
                 
@@ -1047,6 +1054,12 @@ async fn process_translation_loop(
                     Ok((transcription, _)) => {
                         let transcribe_time = transcribe_start.elapsed();
                         if !transcription.trim().is_empty() {
+                            let duration_ms = (final_samples.len() as u64 * 1000) / 16000;
+                            if is_likely_hallucination(&transcription, duration_ms, rms) {
+                                println!("[INFO] Dropping likely hallucination (duration_ms={}, rms={:.5}): {}", duration_ms, rms, transcription);
+                                return;
+                            }
+
                             let source_full = user_setting.get_source_full();
                             let target_full = user_setting.get_target_full();
                             

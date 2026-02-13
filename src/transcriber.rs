@@ -58,6 +58,11 @@ impl Transcriber {
             params.set_print_progress(false);
             params.set_print_realtime(false);
             params.set_print_timestamps(false);
+            params.set_no_context(true);
+            params.set_suppress_blank(true);
+            params.set_suppress_nst(true);
+            params.set_temperature(0.0);
+            params.set_no_speech_thold(0.6);
             
             state.full(params, audio_data)?;
             
@@ -84,6 +89,11 @@ impl Transcriber {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        params.set_no_context(true);
+        params.set_suppress_blank(true);
+        params.set_suppress_nst(true);
+        params.set_temperature(0.0);
+        params.set_no_speech_thold(0.6);
 
         state.full(params, audio_data)?;
         let transcription = self.extract_text(&state)?;
@@ -174,6 +184,39 @@ pub fn convert_i16_to_f32(samples: &[i16]) -> Vec<f32> {
     samples.iter()
         .map(|&s| s as f32 / 32768.0)
         .collect()
+}
+
+pub fn compute_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    let sum_squares: f32 = samples.iter().map(|s| s * s).sum();
+    let mean = sum_squares / samples.len() as f32;
+    mean.sqrt()
+}
+
+pub fn is_likely_hallucination(text: &str, duration_ms: u64, rms: f32) -> bool {
+    let normalized: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && !"。、！!？?".contains(*c))
+        .collect();
+
+    let short_audio = duration_ms < 1200;
+    let low_energy = rms < 0.01;
+
+    if !(short_audio || low_energy) {
+        return false;
+    }
+
+    let known_phrases = [
+        "お疲れ様でした",
+        "おつかれさまでした",
+        "ご視聴ありがとうございました",
+        "ごしちょうありがとうございました",
+    ];
+
+    known_phrases.iter().any(|phrase| normalized.contains(phrase))
 }
 
 pub fn downsample_48k_to_16k(samples: &[f32]) -> Vec<f32> {
