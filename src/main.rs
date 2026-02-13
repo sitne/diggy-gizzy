@@ -6,6 +6,7 @@ use twilight_http::Client as HttpClient;
 use twilight_interactions::command::{CommandModel, CreateCommand};
 use twilight_model::{
     application::interaction::{Interaction, InteractionData, InteractionType},
+    application::interaction::application_command::CommandOptionValue,
     gateway::payload::incoming::ReactionAdd,
     gateway::payload::incoming::ReactionRemove,
     http::interaction::{InteractionResponse, InteractionResponseType},
@@ -18,18 +19,55 @@ use songbird::shards::TwilightMap;
 use songbird::driver::{DecodeMode, Channels, SampleRate};
 
 mod voice_recorder;
+mod voice_translator;
 mod transcriber;
 mod summarizer;
+mod translator;
 mod commands;
+mod user_settings;
 
 use voice_recorder::{RecordingManager, VoiceReceiveHandler};
+use voice_translator::{TranslationManager, VoiceTranslateHandler};
 use transcriber::{Transcriber, transcribe_wav_file};
 use summarizer::Summarizer;
+use translator::Translator;
 use commands::RecordingCommands;
+use user_settings::UserSettingsManager;
 
 #[derive(CommandModel, CreateCommand)]
 #[command(name = "record", desc = "Join voice channel and start recording control")]
 struct RecordCommand;
+
+/// Language choices for translation
+#[derive(twilight_interactions::command::CommandOption, twilight_interactions::command::CreateOption)]
+enum Language {
+    #[option(name = "🇯🇵 Japanese", value = "ja")]
+    Japanese,
+    #[option(name = "🇰🇷 Korean", value = "ko")]
+    Korean,
+    #[option(name = "🇺🇸 English", value = "en")]
+    English,
+}
+
+/// Set language for translation command
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "translate_set", desc = "Set your language for translation")]
+struct TranslateSetCommand {
+    /// Your speaking language
+    source: Language,
+    /// Target language for translation
+    target: Language,
+}
+
+/// Start real-time voice translation
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "translate_start", desc = "Start real-time voice translation")]
+struct TranslateStartCommand;
+
+/// Stop real-time voice translation
+#[derive(CommandModel, CreateCommand)]
+#[command(name = "translate_stop", desc = "Stop real-time voice translation")]
+struct TranslateStopCommand;
 
 
 
@@ -38,9 +76,14 @@ struct BotState {
     application_id: Id<twilight_model::id::marker::ApplicationMarker>,
     http_client: ReqwestClient,
     recording_commands: RecordingCommands,
+    translation_manager: Arc<TranslationManager>,
+    translator: Arc<Translator>,
+    transcriber: Arc<Transcriber>,
+    user_settings: Arc<UserSettingsManager>,
     user_voice_states: Arc<Mutex<HashMap<Id<twilight_model::id::marker::UserMarker>, Id<twilight_model::id::marker::ChannelMarker>>>>,
     songbird: Arc<Songbird>,
     voice_handlers: Arc<Mutex<HashMap<Id<twilight_model::id::marker::GuildMarker>, voice_recorder::VoiceReceiveHandler>>>,
+    translate_handlers: Arc<Mutex<HashMap<Id<twilight_model::id::marker::GuildMarker>, VoiceTranslateHandler>>>,
     // Reaction control: (message_id, channel_id, guild_id, user_id) -> is_recording
     reaction_controls: Arc<Mutex<HashMap<(Id<twilight_model::id::marker::MessageMarker>, Id<twilight_model::id::marker::ChannelMarker>, Id<twilight_model::id::marker::GuildMarker>, Id<twilight_model::id::marker::UserMarker>), bool>>>,
 }
@@ -65,8 +108,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let zai_api_key = env::var("ZAI_API_KEY")
         .unwrap_or_default();
 
+    let deepl_api_key = env::var("DEEPL_API_KEY")
+        .expect("DEEPL_API_KEY must be set");
+
     let whisper_model_path = env::var("WHISPER_MODEL_PATH")
         .unwrap_or_else(|_| "./models/ggml-base.bin".to_string());
+
+    let whisper_model_fast_path = env::var("WHISPER_MODEL_FAST_PATH")
+        .unwrap_or_else(|_| "./models/ggml-large-v3-turbo-q5_0.bin".to_string());
 
     let http_client = ReqwestClient::new();
     let intents = Intents::GUILD_VOICE_STATES | Intents::GUILDS | Intents::GUILD_MEMBERS | Intents::GUILD_MESSAGE_REACTIONS | Intents::GUILD_MESSAGES;
@@ -95,36 +144,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let recording_manager = Arc::new(RecordingManager::new("./recordings".to_string()));
     let transcriber = Arc::new(Transcriber::new(&whisper_model_path)?);
-    let summarizer = Arc::new(Summarizer::new(zai_api_key));
+    let transcriber_fast = Arc::new(Transcriber::new(&whisper_model_fast_path)?);
+    let summarizer = Arc::new(Summarizer::new(zai_api_key.clone()));
+    let translation_manager = Arc::new(TranslationManager::new());
+    let translator = Arc::new(Translator::new(deepl_api_key));
+    let user_settings = Arc::new(UserSettingsManager::new("./user_settings.json"));
 
     let recording_commands = RecordingCommands::new(
-        recording_manager,
-        transcriber,
+        recording_manager.clone(),
+        transcriber.clone(),
         summarizer,
     );
 
-    // Register global commands
+    // Register global commands using twilight-interactions
     println!("[INFO] Registering global commands...");
     let interaction_client = http.interaction(application_id);
     
-    // First, clear all existing global commands to avoid conflicts with old commands
-    println!("[INFO] Clearing existing global commands...");
-    match interaction_client.set_global_commands(&[]).await {
-        Ok(_) => println!("[INFO] Global commands cleared successfully"),
-        Err(e) => eprintln!("[WARN] Failed to clear global commands: {}", e),
-    }
+    let commands = vec![
+        RecordCommand::create_command().into(),
+        TranslateStartCommand::create_command().into(),
+        TranslateStopCommand::create_command().into(),
+        TranslateSetCommand::create_command().into(),
+    ];
     
-    // Register only record command
-    match interaction_client
-        .create_global_command()
-        .chat_input("record", "Join voice channel and start recording control")
-        .await
-    {
-        Ok(_) => println!("[INFO] Registered global command: record"),
-        Err(e) => eprintln!("[ERROR] Failed to register command 'record': {}", e),
+    match interaction_client.set_global_commands(&commands).await {
+        Ok(_) => println!("[INFO] Global commands registered successfully"),
+        Err(e) => eprintln!("[ERROR] Failed to register global commands: {}", e),
     }
-    
-    println!("[INFO] Global commands registration completed");
     
     // Note: Guild commands are automatically removed when the bot leaves a guild
     // or can be manually removed by kicking and re-inviting the bot to a guild
@@ -134,9 +180,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         application_id,
         http_client,
         recording_commands,
+        translation_manager,
+        translator,
+        transcriber: transcriber_fast,
+        user_settings,
         user_voice_states: Arc::new(Mutex::new(HashMap::new())),
         songbird: Arc::new(songbird),
         voice_handlers: Arc::new(Mutex::new(HashMap::new())),
+        translate_handlers: Arc::new(Mutex::new(HashMap::new())),
         reaction_controls: Arc::new(Mutex::new(HashMap::new())),
     });
 
@@ -556,23 +607,22 @@ async fn handle_command(
     interaction: Interaction,
     state: Arc<BotState>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if let Some(InteractionData::ApplicationCommand(command_data)) = interaction.data {
-        let interaction_id = interaction.id;
-        let token = interaction.token.clone();
-        let guild_id = interaction.guild_id;
-        let _channel_id = interaction.channel_id;
-
+    let interaction_id = interaction.id;
+    let token = interaction.token.clone();
+    let guild_id = interaction.guild_id;
+    let channel_id = interaction.channel_id;
+    let user_id = interaction
+        .user
+        .as_ref()
+        .map(|u| u.id)
+        .or_else(|| interaction.member.as_ref().and_then(|m| m.user.as_ref().map(|u| u.id)));
+    
+    if let Some(InteractionData::ApplicationCommand(ref command_data)) = interaction.data {
         match command_data.name.as_str() {
             "record" => {
                 if let Some(guild_id) = guild_id {
-                    let user_voice_states = state.user_voice_states.lock().await;
-                    let user_id = interaction
-                        .user
-                        .map(|u| u.id)
-                        .or_else(|| interaction.member.as_ref().and_then(|m| m.user.as_ref().map(|u| u.id)));
-                    let channel_id = interaction.channel_id;
-
                     if let (Some(user_id), Some(channel_id)) = (user_id, channel_id) {
+                        let _user_voice_states = state.user_voice_states.lock().await;
                         // Send control message with 🔴 reaction
                         let control_message_response = state.http.create_message(channel_id)
                             .content("🔴 **Recording Control**\n\nPress 🔴 to start recording\nPress 🔴 again to stop and generate meeting minutes")
@@ -616,11 +666,443 @@ async fn handle_command(
                     ).await?;
                 }
             }
+            "translate_start" => {
+                handle_translate_start(interaction, state).await?;
+            }
+            "translate_stop" => {
+                handle_translate_stop(interaction, state).await?;
+            }
+            "translate_set" => {
+                handle_translate_set(interaction, state).await?;
+            }
             _ => {}
         }
     }
 
     Ok(())
+}
+
+async fn handle_translate_start(
+    interaction: Interaction,
+    state: Arc<BotState>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let interaction_id = interaction.id;
+    let token = interaction.token.clone();
+    let guild_id = interaction.guild_id;
+
+    if let Some(guild_id) = guild_id {
+        if state.recording_commands.recording_manager.is_recording(guild_id).await {
+            send_error_response(
+                state.http.clone(),
+                state.application_id,
+                interaction_id,
+                token,
+                "Cannot start translation while recording is in progress"
+            ).await?;
+            return Ok(());
+        }
+
+        if state.translation_manager.is_translating(guild_id).await {
+            send_error_response(
+                state.http.clone(),
+                state.application_id,
+                interaction_id,
+                token,
+                "Translation is already active"
+            ).await?;
+            return Ok(());
+        }
+
+        let user_id = interaction
+            .user
+            .map(|u| u.id)
+            .or_else(|| interaction.member.as_ref().and_then(|m| m.user.as_ref().map(|u| u.id)));
+
+        if let Some(user_id) = user_id {
+            let voice_states = state.user_voice_states.lock().await;
+            
+            if let Some(voice_channel_id) = voice_states.get(&user_id).copied() {
+                drop(voice_states);
+
+                let channel_id_nz = match NonZeroU64::new(voice_channel_id.get()) {
+                    Some(id) => id,
+                    None => {
+                        send_error_response(
+                            state.http.clone(),
+                            state.application_id,
+                            interaction_id,
+                            token,
+                            "Invalid voice channel"
+                        ).await?;
+                        return Ok(());
+                    }
+                };
+
+                let call_result = state.songbird.join(guild_id, channel_id_nz).await;
+
+                match call_result {
+                    Ok(call) => {
+                        let _session = state.translation_manager
+                            .start_translation(guild_id, voice_channel_id, voice_translator::TranslationPair::new("ja", "en"))
+                            .await;
+
+                        let translate_handler = VoiceTranslateHandler::new(
+                            state.translation_manager.clone(),
+                            guild_id,
+                        );
+
+                        let mut call_lock = call.lock().await;
+                        call_lock.add_global_event(
+                            SongbirdEvent::Core(CoreEvent::SpeakingStateUpdate),
+                            translate_handler.clone(),
+                        );
+                        call_lock.add_global_event(
+                            SongbirdEvent::Core(CoreEvent::VoiceTick),
+                            translate_handler.clone(),
+                        );
+                        drop(call_lock);
+
+                        state.translate_handlers.lock().await.insert(guild_id, translate_handler);
+
+                        let http = state.http.clone();
+                        let application_id = state.application_id;
+                        let translation_manager = state.translation_manager.clone();
+                        let translator = state.translator.clone();
+                        let transcriber = state.transcriber.clone();
+                        let user_settings = state.user_settings.clone();
+                        let guild_id_for_task = guild_id;
+
+                        tokio::spawn(async move {
+                            process_translation_loop(
+                                http,
+                                application_id,
+                                translation_manager,
+                                translator,
+                                transcriber,
+                                user_settings,
+                                guild_id_for_task,
+                                voice_channel_id,
+                            ).await;
+                        });
+
+                        let response = InteractionResponse {
+                            kind: InteractionResponseType::ChannelMessageWithSource,
+                            data: Some(twilight_model::http::interaction::InteractionResponseData {
+                                content: Some("🌐 **Translation started!**\n\nUse `/translate_set <source> <target>` to configure your language pair.\n\n**Examples:**\n• `/translate_set ja ko` - Japanese to Korean\n• `/translate_set ko ja` - Korean to Japanese\n• `/translate_set en ja` - English to Japanese".to_string()),
+                                ..Default::default()
+                            }),
+                        };
+
+                        state.http
+                            .interaction(state.application_id)
+                            .create_response(interaction_id, &token, &response)
+                            .await?;
+                    }
+                    Err(e) => {
+                        eprintln!("[ERROR] Failed to join voice channel: {:?}", e);
+                        send_error_response(
+                            state.http.clone(),
+                            state.application_id,
+                            interaction_id,
+                            token,
+                            &format!("Failed to join voice channel: {}", e)
+                        ).await?;
+                    }
+                }
+            } else {
+                send_error_response(
+                    state.http.clone(),
+                    state.application_id,
+                    interaction_id,
+                    token,
+                    "You must be in a voice channel"
+                ).await?;
+            }
+        }
+    } else {
+        send_error_response(
+            state.http.clone(),
+            state.application_id,
+            interaction_id,
+            token,
+            "This command can only be used in a server"
+        ).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_translate_stop(
+    interaction: Interaction,
+    state: Arc<BotState>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let interaction_id = interaction.id;
+    let token = interaction.token.clone();
+    let guild_id = interaction.guild_id;
+
+    if let Some(guild_id) = guild_id {
+        if !state.translation_manager.is_translating(guild_id).await {
+            send_error_response(
+                state.http.clone(),
+                state.application_id,
+                interaction_id,
+                token,
+                "No active translation session"
+            ).await?;
+            return Ok(());
+        }
+
+        state.translation_manager.stop_translation(guild_id).await;
+        state.translate_handlers.lock().await.remove(&guild_id);
+
+        if let Err(e) = state.songbird.leave(guild_id).await {
+            eprintln!("[ERROR] Failed to leave voice channel: {}", e);
+        }
+
+        let response = InteractionResponse {
+            kind: InteractionResponseType::ChannelMessageWithSource,
+            data: Some(twilight_model::http::interaction::InteractionResponseData {
+                content: Some("✅ **Translation stopped!**".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        state.http
+            .interaction(state.application_id)
+            .create_response(interaction_id, &token, &response)
+            .await?;
+    } else {
+        send_error_response(
+            state.http.clone(),
+            state.application_id,
+            interaction_id,
+            token,
+            "This command can only be used in a server"
+        ).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_translate_set(
+    interaction: Interaction,
+    state: Arc<BotState>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let interaction_id = interaction.id;
+    let token = interaction.token.clone();
+    
+    let user_id = interaction
+        .user
+        .map(|u| u.id)
+        .or_else(|| interaction.member.as_ref().and_then(|m| m.user.as_ref().map(|u| u.id)));
+
+    if let Some(user_id) = user_id {
+        if let Some(InteractionData::ApplicationCommand(command_data)) = interaction.data {
+            let mut source_lang = None;
+            let mut target_lang = None;
+            
+            for option in &command_data.options {
+                match option.name.as_str() {
+                    "source" => {
+                        if let CommandOptionValue::String(val) = &option.value {
+                            source_lang = Some(val.as_str());
+                        }
+                    }
+                    "target" => {
+                        if let CommandOptionValue::String(val) = &option.value {
+                            target_lang = Some(val.as_str());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            let (source, target) = match (source_lang, target_lang) {
+                (Some(s), Some(t)) => (s, t),
+                _ => {
+                    send_error_response(
+                        state.http.clone(),
+                        state.application_id,
+                        interaction_id,
+                        token,
+                        "Please select both source and target languages"
+                    ).await?;
+                    return Ok(());
+                }
+            };
+            
+            let valid_langs = ["ja", "ko", "en"];
+            if !valid_langs.contains(&source) || !valid_langs.contains(&target) {
+                send_error_response(
+                    state.http.clone(),
+                    state.application_id,
+                    interaction_id,
+                    token,
+                    "Invalid language codes. Use: ja, ko, or en"
+                ).await?;
+                return Ok(());
+            }
+
+            state.user_settings.set_user_language(user_id, source, target).await;
+
+            let flag = |lang: &str| match lang {
+                "ja" => "🇯🇵",
+                "ko" => "🇰🇷",
+                "en" => "🇺🇸",
+                _ => "🌐",
+            };
+
+            let lang_name = |lang: &str| -> String {
+                match lang {
+                    "ja" => "Japanese".to_string(),
+                    "ko" => "Korean".to_string(),
+                    "en" => "English".to_string(),
+                    _ => lang.to_string(),
+                }
+            };
+
+            let response = InteractionResponse {
+                kind: InteractionResponseType::ChannelMessageWithSource,
+                data: Some(twilight_model::http::interaction::InteractionResponseData {
+                    content: Some(format!(
+                        "✅ **Language setting saved!**\n\n{} **Speaking**: {}\n{} **Translation target**: {}",
+                        flag(source),
+                        lang_name(source),
+                        flag(target),
+                        lang_name(target)
+                    )),
+                    ..Default::default()
+                }),
+            };
+
+            state.http
+                .interaction(state.application_id)
+                .create_response(interaction_id, &token, &response)
+                .await?;
+        }
+    } else {
+        send_error_response(
+            state.http.clone(),
+            state.application_id,
+            interaction_id,
+            token,
+            "Could not identify user"
+        ).await?;
+    }
+
+    Ok(())
+}
+
+async fn process_translation_loop(
+    http: Arc<HttpClient>,
+    _application_id: Id<twilight_model::id::marker::ApplicationMarker>,
+    translation_manager: Arc<TranslationManager>,
+    translator: Arc<Translator>,
+    transcriber: Arc<Transcriber>,
+    user_settings: Arc<UserSettingsManager>,
+    guild_id: Id<twilight_model::id::marker::GuildMarker>,
+    voice_channel_id: Id<twilight_model::id::marker::ChannelMarker>,
+) {
+    use twilight_model::channel::message::embed::Embed;
+    use twilight_model::channel::message::embed::EmbedField;
+    use transcriber::convert_i16_to_f32;
+    use transcriber::downsample_48k_to_16k;
+    use std::time::Instant;
+
+    loop {
+        if !translation_manager.is_translating(guild_id).await {
+            break;
+        }
+
+        let ready_buffers = translation_manager.get_ready_translations(guild_id).await;
+
+        for (user_id, samples) in ready_buffers {
+            let http = http.clone();
+            let translator = translator.clone();
+            let transcriber = transcriber.clone();
+            let user_settings = user_settings.clone();
+            let voice_channel_id = voice_channel_id;
+
+            tokio::spawn(async move {
+                let user_setting = match user_settings.get_user_setting(user_id).await {
+                    Some(setting) => setting,
+                    None => {
+                        println!("[INFO] Skipping user {} - no language settings", user_id);
+                        return;
+                    }
+                };
+
+                if samples.len() < 24000 {
+                    return;
+                }
+
+                let total_start = Instant::now();
+                let convert_start = Instant::now();
+                let samples_f32 = convert_i16_to_f32(&samples);
+                let final_samples = downsample_48k_to_16k(&samples_f32);
+                let convert_time = convert_start.elapsed();
+                
+                let transcribe_start = Instant::now();
+                match transcriber.transcribe_with_language(&final_samples, Some(&user_setting.source_lang)) {
+                    Ok((transcription, _)) => {
+                        let transcribe_time = transcribe_start.elapsed();
+                        if !transcription.trim().is_empty() {
+                            let source_full = user_setting.get_source_full();
+                            let target_full = user_setting.get_target_full();
+                            
+                            let translate_start = Instant::now();
+                            match translator.translate(&transcription, &source_full, &target_full).await {
+                                Ok(translated) => {
+                                    let translate_time = translate_start.elapsed();
+                                    let total_time = total_start.elapsed();
+                                    println!("[PERF] Convert: {:?}, Transcribe: {:?}, Translate: {:?}, Total: {:?}", convert_time, transcribe_time, translate_time, total_time);
+                                    
+                                    let embed = Embed {
+                                        author: None,
+                                        color: Some(0x3498db),
+                                        description: None,
+                                        fields: vec![
+                                            EmbedField {
+                                                inline: false,
+                                                name: format!("🗣️ Original ({})", user_setting.source_lang.to_uppercase()),
+                                                value: transcription,
+                                            },
+                                            EmbedField {
+                                                inline: false,
+                                                name: format!("🌐 Translation ({})", user_setting.target_lang.to_uppercase()),
+                                                value: translated,
+                                            },
+                                        ],
+                                        footer: None,
+                                        image: None,
+                                        kind: "rich".to_string(),
+                                        provider: None,
+                                        thumbnail: None,
+                                        timestamp: None,
+                                        title: Some("Real-time Translation".to_string()),
+                                        url: None,
+                                        video: None,
+                                    };
+
+                                    let _ = http.create_message(voice_channel_id)
+                                        .embeds(&[embed])
+                                        .await;
+                                }
+                                Err(e) => {
+                                    eprintln!("[ERROR] Translation failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ERROR] Transcription failed: {}", e);
+                    }
+                }
+            });
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
 }
 
 async fn send_error_response(

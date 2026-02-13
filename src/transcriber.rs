@@ -1,6 +1,20 @@
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 use std::path::Path;
 
+const LANGUAGE_CODES: &[&str] = &[
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv",
+    "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
+    "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr",
+    "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
+    "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu",
+    "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl",
+    "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su",
+];
+
+fn get_lang_str_from_id(lang_id: i32) -> &'static str {
+    LANGUAGE_CODES.get(lang_id as usize).copied().unwrap_or("en")
+}
+
 pub struct Transcriber {
     ctx: WhisperContext,
 }
@@ -20,18 +34,51 @@ impl Transcriber {
     }
 
     pub fn transcribe(&self, audio_data: &[f32], language: Option<&str>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let (text, _) = self.transcribe_with_language(audio_data, language)?;
+        Ok(text)
+    }
+
+    /// Transcribe audio and return (text, detected_language_code)
+    /// If language is None, auto-detects the language
+    pub fn transcribe_with_language(&self, audio_data: &[f32], language: Option<&str>) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         if audio_data.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), "en".to_string()));
         }
 
-        let mut state = self.ctx.create_state()?;
+        // First pass: auto-detect language
+        let detected_lang = if let Some(lang) = language {
+            lang.to_string()
+        } else {
+            let mut state = self.ctx.create_state()?;
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            
+            // First pass without language hint to detect language
+            params.set_translate(false);
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            
+            state.full(params, audio_data)?;
+            
+            match state.lang_detect(0, 4) {
+                Ok((lang_id, _probs)) => {
+                    get_lang_str_from_id(lang_id).to_string()
+                }
+                Err(_) => {
+                    // Fallback to local detection based on text content
+                    let text = self.extract_text(&state)?;
+                    Self::detect_language_local(&text)
+                }
+            }
+        };
 
+        // Second pass: transcribe with detected language
+        let mut state = self.ctx.create_state()?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         
-        if let Some(lang) = language {
-            params.set_language(Some(lang));
-        }
-        
+        // Set the detected language for transcription
+        params.set_language(Some(&detected_lang));
         params.set_translate(false);
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -39,7 +86,12 @@ impl Transcriber {
         params.set_print_timestamps(false);
 
         state.full(params, audio_data)?;
+        let transcription = self.extract_text(&state)?;
+        
+        Ok((transcription, detected_lang))
+    }
 
+    fn extract_text(&self, state: &whisper_rs::WhisperState) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let num_segments = state.full_n_segments()?;
         let mut transcription = String::new();
 
@@ -52,6 +104,32 @@ impl Transcriber {
         }
 
         Ok(transcription.trim().to_string())
+    }
+
+    /// Fallback local language detection based on character types
+    fn detect_language_local(text: &str) -> String {
+        let mut hiragana_count = 0;
+        let mut katakana_count = 0;
+        let mut kanji_count = 0;
+        
+        for c in text.chars() {
+            if ('\u{3040}'..='\u{309F}').contains(&c) {
+                hiragana_count += 1;
+            } else if ('\u{30A0}'..='\u{30FF}').contains(&c) {
+                katakana_count += 1;
+            } else if ('\u{4E00}'..='\u{9FFF}').contains(&c) {
+                kanji_count += 1;
+            }
+        }
+        
+        let total_chars = text.chars().count();
+        let japanese_chars = hiragana_count + katakana_count + kanji_count;
+        
+        if total_chars > 0 && japanese_chars * 10 > total_chars {
+            "ja".to_string()
+        } else {
+            "en".to_string()
+        }
     }
 
     pub fn transcribe_with_timestamps(&self, audio_data: &[f32], language: Option<&str>) -> Result<Vec<(i64, i64, String)>, Box<dyn std::error::Error + Send + Sync>> {

@@ -2,3 +2,4 @@
 .env
 /models
 /recordings
+user_settings.json

@@ -146,13 +146,14 @@ impl RecordingManager {
         
         for (ssrc, buffer) in buffers.drain() {
             if !buffer.is_empty() {
-                let user_id = ssrc_map.get(&ssrc).copied().unwrap_or_else(|| {
-                    Id::new(ssrc as u64)
-                });
-                
-                let sessions = self.active_sessions.read().await;
-                if let Some(session) = sessions.get(&guild_id) {
-                    session.add_audio(user_id, &buffer).await;
+                // Only process if we have a valid user mapping (not SSRC fallback)
+                if let Some(&user_id) = ssrc_map.get(&ssrc) {
+                    let sessions = self.active_sessions.read().await;
+                    if let Some(session) = sessions.get(&guild_id) {
+                        session.add_audio(user_id, &buffer).await;
+                    }
+                } else {
+                    println!("[WARN] Skipping audio buffer for SSRC {} - no user mapping found", ssrc);
                 }
             }
         }
@@ -190,8 +191,13 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                     let ssrc = speaking.ssrc;
                     let user_id = Id::new(user_id.0);
                     
+                    println!("[DEBUG] SpeakingStateUpdate: SSRC {} -> User {}", ssrc, user_id);
+                    
                     let mut ssrc_map = self.ssrc_to_user.lock().await;
                     ssrc_map.insert(ssrc, user_id);
+                    println!("[DEBUG] SSRC map size: {}", ssrc_map.len());
+                } else {
+                    println!("[DEBUG] SpeakingStateUpdate: user_id is None for SSRC {}", speaking.ssrc);
                 }
             }
             EventContext::VoiceTick(tick) => {
@@ -201,16 +207,17 @@ impl SongbirdEventHandler for VoiceReceiveHandler {
                         
                         if !samples.is_empty() {
                             let ssrc_map = self.ssrc_to_user.lock().await;
-                            let user_id = ssrc_map.get(ssrc).copied().unwrap_or_else(|| {
-                                Id::new(*ssrc as u64)
-                            });
-                            drop(ssrc_map);
-                            
-                            self.recording_manager.add_audio_to_session(
-                                self.guild_id,
-                                user_id,
-                                &samples,
-                            ).await;
+                            // Only process if we have a valid user mapping
+                            if let Some(&user_id) = ssrc_map.get(ssrc) {
+                                drop(ssrc_map);
+                                self.recording_manager.add_audio_to_session(
+                                    self.guild_id,
+                                    user_id,
+                                    &samples,
+                                ).await;
+                            } else {
+                                println!("[WARN] VoiceTick: No user mapping for SSRC {}, skipping audio", ssrc);
+                            }
                         }
                     }
                 }
